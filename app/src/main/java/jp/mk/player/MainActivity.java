@@ -376,7 +376,10 @@ public class MainActivity extends Activity {
                 seeking = false;
                 if (service != null) {
                     double dur = currentDurationSec();
-                    if (dur > 0) service.engine().seekTo(dur * b.getProgress() / 1000.0);
+                    if (dur > 0) {
+                        service.engine().seekTo(dur * b.getProgress() / 1000.0);
+                        service.syncSessionState();
+                    }
                 }
             }
         });

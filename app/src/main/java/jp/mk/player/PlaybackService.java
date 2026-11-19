@@ -6,9 +6,15 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.MediaMetadata;
+import android.media.MediaMetadataRetriever;
+import android.media.session.MediaSession;
+import android.media.session.PlaybackState;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
@@ -16,7 +22,11 @@ import android.os.IBinder;
 
 import java.util.ArrayList;
 
-/** 再生を担うフォアグラウンドサービス。キューと現在曲を持ち、通知操作も受ける。 */
+/**
+ * 再生を担うフォアグラウンドサービス。キューと現在曲を持ち、通知操作も受ける。
+ * MediaSession を持ち、通知領域／クイック設定のメディアプレーヤー、ロック画面、
+ * Bluetooth・ヘッドセットのボタンからも操作できる（Android標準のメディア操作）。
+ */
 public class PlaybackService extends Service {
     public static final String ACTION = "jp.mk.player.ACTION";
     public static final String PLAY = "play", PAUSE = "pause", NEXT = "next", PREV = "prev";
@@ -41,12 +51,16 @@ public class PlaybackService extends Service {
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
     private boolean focusHeld = false;
+    private MediaSession session;
+    private Bitmap artBitmap;
+    private Uri artUri;
 
     private final AudioManager.OnAudioFocusChangeListener focusListener = change -> {
         if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
             if (engine != null && engine.isPlaying()) {
                 engine.pause();
                 updateNotification(false);
+                syncSessionState();
                 notifyChanged();
             }
         }
@@ -62,6 +76,7 @@ public class PlaybackService extends Service {
                     playIndex(current + 1);
                 } else {
                     updateNotification(false);
+                    syncSessionState();
                     notifyChanged();
                 }
             }
@@ -71,6 +86,22 @@ public class PlaybackService extends Service {
             }
         });
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        session = new MediaSession(this, "MkPlayer");
+        session.setCallback(new MediaSession.Callback() {
+            @Override public void onPlay() { resume(); }
+            @Override public void onPause() { pause(); }
+            @Override public void onSkipToNext() { next(); }
+            @Override public void onSkipToPrevious() { previous(); }
+            @Override public void onSeekTo(long pos) {
+                if (engine != null) {
+                    engine.seekTo(pos / 1000.0);
+                    syncSessionState();
+                    notifyChanged();
+                }
+            }
+            @Override public void onStop() { pause(); }
+        });
+        session.setActive(true);
     }
 
     @Override public IBinder onBind(Intent intent) { return binder; }
@@ -117,6 +148,7 @@ public class PlaybackService extends Service {
         engine.open(queue.get(index));
         engine.play();
         startForeground(1, notification(true));
+        syncSession();
         notifyChanged();
         if (listener != null) listener.trackChanged();
     }
@@ -133,6 +165,7 @@ public class PlaybackService extends Service {
             engine.playFrom(positionSec);
             engine.pause();
         }
+        syncSession();
         notifyChanged();
         if (listener != null) listener.trackChanged();
     }
@@ -142,6 +175,7 @@ public class PlaybackService extends Service {
     public void pause() {
         if (engine != null) engine.pause();
         updateNotification(false);
+        syncSessionState();
         notifyChanged();
     }
 
@@ -154,6 +188,7 @@ public class PlaybackService extends Service {
         requestFocus();
         engine.resume();
         startForeground(1, notification(true));
+        syncSessionState();
         notifyChanged();
     }
 
@@ -164,6 +199,8 @@ public class PlaybackService extends Service {
     public void previous() {
         if (engine != null && engine.getPositionSec() > 3) {
             engine.seekTo(0);
+            syncSessionState();
+            notifyChanged();
             return;
         }
         if (!queue.isEmpty()) playIndex(current <= 0 ? queue.size() - 1 : current - 1);
@@ -174,6 +211,13 @@ public class PlaybackService extends Service {
         if (engine != null) engine.stop();
         queue.clear();
         current = -1;
+        artUri = null;
+        artBitmap = null;
+        if (session != null) {
+            session.setMetadata(null);
+            session.setPlaybackState(new PlaybackState.Builder()
+                    .setState(PlaybackState.STATE_NONE, 0, 0f).build());
+        }
         try { stopForeground(true); } catch (Exception ignored) { }
         notifyChanged();
     }
@@ -182,6 +226,68 @@ public class PlaybackService extends Service {
         title = t;
         artist = a;
         updateNotification(isPlaying());
+        syncSessionMetadata();
+    }
+
+    // --- MediaSession 同期（通知領域／ロック画面／Bluetooth操作用） ---
+
+    private void syncSession() {
+        syncSessionMetadata();
+        syncSessionState();
+    }
+
+    private void syncSessionMetadata() {
+        if (session == null) return;
+        MediaMetadata.Builder b = new MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+                .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, title)
+                .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, artist);
+        if (engine != null && engine.getDurationSec() > 0) {
+            b.putLong(MediaMetadata.METADATA_KEY_DURATION,
+                    (long) (engine.getDurationSec() * 1000));
+        }
+        Bitmap art = artFor(currentUri());
+        if (art != null) {
+            b.putBitmap(MediaMetadata.METADATA_KEY_ART, art);
+            b.putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, art);
+        }
+        try { session.setMetadata(b.build()); } catch (Exception ignored) { }
+    }
+
+    /** 画面側のシーク操作後に、メディアパネル側の位置表示を合わせるために呼ぶ。 */
+    public void syncSessionState() {
+        if (session == null || engine == null) return;
+        boolean playing = engine.isPlaying();
+        long actions = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
+                | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_SKIP_TO_NEXT
+                | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_SEEK_TO
+                | PlaybackState.ACTION_STOP;
+        try {
+            session.setPlaybackState(new PlaybackState.Builder()
+                    .setActions(actions)
+                    .setState(playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
+                            (long) (engine.getPositionSec() * 1000), playing ? 1.0f : 0.0f)
+                    .build());
+        } catch (Exception ignored) { }
+    }
+
+    /** 現在曲の埋め込みアートワークを取得（曲ごとにキャッシュ）。 */
+    private Bitmap artFor(Uri u) {
+        if (u == null) return null;
+        if (u.equals(artUri)) return artBitmap;
+        artUri = u;
+        artBitmap = null;
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        try {
+            r.setDataSource(this, u);
+            byte[] pic = r.getEmbeddedPicture();
+            if (pic != null) artBitmap = BitmapFactory.decodeByteArray(pic, 0, pic.length);
+        } catch (Exception ignored) {
+        } finally {
+            try { r.release(); } catch (Exception ignored) { }
+        }
+        return artBitmap;
     }
 
     private void requestFocus() {
@@ -225,14 +331,22 @@ public class PlaybackService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, "playback") : new Notification.Builder(this);
-        return builder.setSmallIcon(android.R.drawable.ic_media_play)
+        builder.setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentTitle(title).setContentText(artist).setContentIntent(content)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOngoing(playing)
                 .addAction(android.R.drawable.ic_media_previous, "前へ", command(PREV, 1))
                 .addAction(playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
                         playing ? "一時停止" : "再生", command(playing ? PAUSE : PLAY, 2))
-                .addAction(android.R.drawable.ic_media_next, "次へ", command(NEXT, 3))
-                .build();
+                .addAction(android.R.drawable.ic_media_next, "次へ", command(NEXT, 3));
+        Bitmap art = artFor(currentUri());
+        if (art != null) builder.setLargeIcon(art);
+        if (session != null) {
+            builder.setStyle(new Notification.MediaStyle()
+                    .setMediaSession(session.getSessionToken())
+                    .setShowActionsInCompactView(0, 1, 2));
+        }
+        return builder.build();
     }
 
     private void updateNotification(boolean playing) {
@@ -245,6 +359,10 @@ public class PlaybackService extends Service {
 
     @Override public void onDestroy() {
         if (engine != null) engine.stop();
+        if (session != null) {
+            try { session.setActive(false); } catch (Exception ignored) { }
+            session.release();
+        }
         if (audioManager != null && focusHeld && Build.VERSION.SDK_INT >= 26 && focusRequest != null) {
             audioManager.abandonAudioFocusRequest(focusRequest);
         }
