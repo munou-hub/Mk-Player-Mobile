@@ -1,0 +1,62 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+
+# リリースへのAPK添付に必要（MkFRE V6.1で不足して失敗した権限）
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      # Android SDK はランナーイメージにプリインストール済み（ANDROID_HOME 設定済み）。
+      # android-actions/setup-android は使わない（BatteryHub 実行 #1 でこのステップが失敗したため）。
+      # sdkmanager は PATH に無いことがあるので絶対パスで呼び、失敗してもビルドは続行する
+      # （platform 34 はイメージに含まれているため、通常はこのステップ自体が不要）。
+      - name: Ensure Android platform 34
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+            "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" || true
+          fi
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Rename APK with version
+        run: |
+          VER=$(grep -oP "versionName '\K[^']+" app/build.gradle)
+          cp app/build/outputs/apk/debug/app-debug.apk "MkPlayer-v${VER}.apk"
+          ls -la "MkPlayer-v${VER}.apk"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkplayer-apk
+          path: MkPlayer-v*.apk
+
+      - name: Attach to release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MkPlayer-v*.apk

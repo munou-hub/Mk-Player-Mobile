@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#050505</color>
+    <color name="panel">#080808</color>
+    <color name="text_main">#F1F1F1</color>
+    <color name="text_sub">#999999</color>
+</resources>
