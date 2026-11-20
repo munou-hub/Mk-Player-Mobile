@@ -24,7 +24,7 @@ PC版（PySide6、仕様v0.6）のUIと思想を継承した、ローカル音�
 
 ## 動作環境
 
-- Android 8.0（API 26）以上。主対象は Xperia 1 II / Android 12
+- Android 8.0（API 26）以上。　Xperia 1 II実機で動作確認済み
 - 対応形式は端末デコーダ依存（MP3 / AAC / M4A / WAV / FLAC / Ogg / Opus 等）
 
 ## ビルド
