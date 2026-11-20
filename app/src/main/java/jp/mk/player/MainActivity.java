@@ -115,7 +115,7 @@ public class MainActivity extends Activity {
             service = ((PlaybackService.PlayerBinder) b).service();
             bound = true;
             service.setListener(new PlaybackService.Listener() {
-                @Override public void changed() { refreshTransport(); renderLists(); }
+                @Override public void changed() { refreshTransport(); }
                 @Override public void failed(String s) {
                     Toast.makeText(MainActivity.this, s, Toast.LENGTH_LONG).show();
                 }
@@ -150,7 +150,10 @@ public class MainActivity extends Activity {
             try { requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1); }
             catch (Exception ignored) { }
         }
-        bindService(new Intent(this, PlaybackService.class), connection, BIND_AUTO_CREATE);
+        // サービスを開始済みにしておく（画面を閉じても再生とメディアコントロールが残る）
+        Intent svcIntent = new Intent(this, PlaybackService.class);
+        try { startService(svcIntent); } catch (Exception ignored) { }
+        bindService(svcIntent, connection, BIND_AUTO_CREATE);
         handler.post(ticker);
         handler.post(meterTicker);
         // ライブラリのタグを裏で順に読む
@@ -231,7 +234,7 @@ public class MainActivity extends Activity {
         header.setGravity(Gravity.CENTER_VERTICAL);
         TextView brand = tv("Mk Player", 16, TEXT, true);
         header.addView(brand, new LinearLayout.LayoutParams(0, -2, 1));
-        header.addView(tv("v1.0", 11, SUB, false));
+        header.addView(tv("v1.2", 11, SUB, false));
         root.addView(header);
 
         // タブ（PC版の3領域分離をタブに再配置）
@@ -577,7 +580,7 @@ public class MainActivity extends Activity {
         col.addView(procReset);
 
         col.addView(settingsSection("情報"));
-        col.addView(tv("Mk Player v1.0\nパッケージ: jp.mk.player\n"
+        col.addView(tv("Mk Player v1.2\nパッケージ: jp.mk.player\n"
                 + "PC版 MK-PLYAR（仕様v0.6）のスマホ版。GEQ / VUメーターは無し。",
                 12, SUB, false));
         return scroll;
@@ -757,7 +760,7 @@ public class MainActivity extends Activity {
                 apply.run();
                 renderLists();
                 if (art != null && art.length > 0) {
-                    artImage.setImageBitmap(BitmapFactory.decodeByteArray(art, 0, art.length));
+                    artImage.setImageBitmap(Tracks.decodeArt(art, 384));
                     artPlaceholder.setVisibility(View.GONE);
                 } else {
                     artImage.setImageBitmap(null);
@@ -1178,6 +1181,7 @@ public class MainActivity extends Activity {
     private void restoreSession() {
         String q = prefs.getString("queue", "");
         if (q.isEmpty() || service == null) return;
+        if (service.getCurrent() >= 0) return; // メディアボタン側で復元済み
         ArrayList<Uri> uris = new ArrayList<>();
         for (String s : q.split("\n")) {
             if (!s.isEmpty()) {

@@ -98,6 +98,22 @@ public class Tracks {
         t.loaded = true;
     }
 
+    /** 埋め込み画像を最大 maxPx px に収まるようサンプルデコードする（原寸デコードは重い）。 */
+    public static android.graphics.Bitmap decodeArt(byte[] pic, int maxPx) {
+        if (pic == null || pic.length == 0) return null;
+        android.graphics.BitmapFactory.Options bounds =
+                new android.graphics.BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        android.graphics.BitmapFactory.decodeByteArray(pic, 0, pic.length, bounds);
+        int sample = 1;
+        int w = bounds.outWidth, h = bounds.outHeight;
+        while (w / (sample * 2) >= maxPx && h / (sample * 2) >= maxPx) sample *= 2;
+        android.graphics.BitmapFactory.Options opt =
+                new android.graphics.BitmapFactory.Options();
+        opt.inSampleSize = sample;
+        return android.graphics.BitmapFactory.decodeByteArray(pic, 0, pic.length, opt);
+    }
+
     public static byte[] loadArt(Context ctx, Uri u) {
         MediaMetadataRetriever m = new MediaMetadataRetriever();
         try {

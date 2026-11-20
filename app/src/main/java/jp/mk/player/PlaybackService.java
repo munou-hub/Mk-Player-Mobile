@@ -5,7 +5,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.AudioAttributes;
@@ -18,7 +22,10 @@ import android.media.session.PlaybackState;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
+import android.view.KeyEvent;
 
 import java.util.ArrayList;
 
@@ -29,6 +36,7 @@ import java.util.ArrayList;
  */
 public class PlaybackService extends Service {
     public static final String ACTION = "jp.mk.player.ACTION";
+    public static final String ACTION_MEDIA_BUTTON = "jp.mk.player.MEDIA_BUTTON";
     public static final String PLAY = "play", PAUSE = "pause", NEXT = "next", PREV = "prev";
 
     public interface Listener {
@@ -54,15 +62,66 @@ public class PlaybackService extends Service {
     private MediaSession session;
     private Bitmap artBitmap;
     private Uri artUri;
+    private boolean resumeOnFocusGain = false;
+    private boolean ducked = false;
+
+    private final Handler sessionHandler = new Handler(Looper.getMainLooper());
+    /** 再生中はセッションの再生位置を周期的に同期する（メディアパネルのバーのドリフト防止）。 */
+    private final Runnable sessionTicker = new Runnable() {
+        @Override public void run() {
+            if (engine != null && engine.isPlaying()) {
+                syncSessionState();
+                sessionHandler.postDelayed(this, 1000);
+            }
+        }
+    };
+
+    /** イヤホン／ヘッドセットを抜いたら一時停止する（標準のメディアアプリの挙動）。 */
+    private final BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) {
+                if (engine != null && engine.isPlaying()) pause();
+            }
+        }
+    };
 
     private final AudioManager.OnAudioFocusChangeListener focusListener = change -> {
-        if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-            if (engine != null && engine.isPlaying()) {
-                engine.pause();
-                updateNotification(false);
-                syncSessionState();
-                notifyChanged();
-            }
+        if (engine == null) return;
+        switch (change) {
+            case AudioManager.AUDIOFOCUS_LOSS:
+                resumeOnFocusGain = false;
+                if (engine.isPlaying()) {
+                    engine.pause();
+                    updateNotification(false);
+                    syncSessionState();
+                    notifyChanged();
+                }
+                break;
+            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                if (engine.isPlaying()) {
+                    resumeOnFocusGain = true;
+                    engine.pause();
+                    updateNotification(false);
+                    syncSessionState();
+                    notifyChanged();
+                }
+                break;
+            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                ducked = true;
+                engine.setDuckFactor(0.25f);
+                break;
+            case AudioManager.AUDIOFOCUS_GAIN:
+                if (ducked) {
+                    ducked = false;
+                    engine.setDuckFactor(1f);
+                }
+                if (resumeOnFocusGain) {
+                    resumeOnFocusGain = false;
+                    resume();
+                }
+                break;
+            default:
+                break;
         }
     };
 
@@ -99,9 +158,13 @@ public class PlaybackService extends Service {
                     notifyChanged();
                 }
             }
-            @Override public void onStop() { pause(); }
+            @Override public void onStop() { stopPlayback(); }
         });
         session.setActive(true);
+        try {
+            registerReceiver(noisyReceiver,
+                    new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY));
+        } catch (Exception ignored) { }
     }
 
     @Override public IBinder onBind(Intent intent) { return binder; }
@@ -113,8 +176,76 @@ public class PlaybackService extends Service {
             else if (PREV.equals(command)) previous();
             else if (PAUSE.equals(command)) pause();
             else if (PLAY.equals(command)) resume();
+        } else if (intent != null && ACTION_MEDIA_BUTTON.equals(intent.getAction())) {
+            handleMediaButton(intent.getIntExtra("keycode", -1));
         }
         return START_NOT_STICKY;
+    }
+
+    /** メディアボタン（ヘッドセット／Bluetooth）からの操作。プロセス復帰直後でも動く。 */
+    private void handleMediaButton(int keycode) {
+        // フォアグラウンド開始を要求されて起動した場合に備え、まず通知を出して前面化する
+        if (engine != null && engine.hasTrack()) {
+            try { startForeground(1, notification(isPlaying())); } catch (Exception ignored) { }
+        }
+        switch (keycode) {
+            case KeyEvent.KEYCODE_MEDIA_PLAY:
+                restoreFromPrefsIfEmpty();
+                resume();
+                break;
+            case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                pause();
+                break;
+            case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+            case KeyEvent.KEYCODE_HEADSETHOOK:
+                restoreFromPrefsIfEmpty();
+                toggle();
+                break;
+            case KeyEvent.KEYCODE_MEDIA_NEXT:
+                next();
+                break;
+            case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+                previous();
+                break;
+            case KeyEvent.KEYCODE_MEDIA_STOP:
+                stopPlayback();
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** プロセスが落ちていた場合に、保存済みキューを一時停止状態で復元する。 */
+    private void restoreFromPrefsIfEmpty() {
+        if (!queue.isEmpty() || engine == null) return;
+        SharedPreferences p = getSharedPreferences("mkplayer", 0);
+        String q = p.getString("queue", "");
+        if (q.isEmpty()) return;
+        ArrayList<Uri> uris = new ArrayList<>();
+        for (String s : q.split("\n")) {
+            if (!s.isEmpty()) uris.add(Uri.parse(s));
+        }
+        int idx = p.getInt("queue_index", -1);
+        long posMs = p.getLong("queue_pos_ms", 0);
+        if (!uris.isEmpty() && idx >= 0 && idx < uris.size()) {
+            restore(uris, idx, posMs / 1000.0, p.getInt("volume", 72) / 100f);
+        }
+    }
+
+    /** 完全停止: エンジン停止＋フォアグラウンド解除＋サービス終了（標準の「停止」）。 */
+    public void stopPlayback() {
+        sessionHandler.removeCallbacks(sessionTicker);
+        resumeOnFocusGain = false;
+        if (engine != null) engine.stop();
+        if (session != null) {
+            try {
+                session.setPlaybackState(new PlaybackState.Builder()
+                        .setState(PlaybackState.STATE_STOPPED, 0, 0f).build());
+            } catch (Exception ignored) { }
+        }
+        try { stopForeground(true); } catch (Exception ignored) { }
+        notifyChanged();
+        stopSelf();
     }
 
     public void setListener(Listener l) { listener = l; }
@@ -149,6 +280,8 @@ public class PlaybackService extends Service {
         engine.play();
         startForeground(1, notification(true));
         syncSession();
+        sessionHandler.removeCallbacks(sessionTicker);
+        sessionHandler.post(sessionTicker);
         notifyChanged();
         if (listener != null) listener.trackChanged();
     }
@@ -173,6 +306,7 @@ public class PlaybackService extends Service {
     public void toggle() { if (isPlaying()) pause(); else resume(); }
 
     public void pause() {
+        sessionHandler.removeCallbacks(sessionTicker);
         if (engine != null) engine.pause();
         updateNotification(false);
         syncSessionState();
@@ -189,6 +323,8 @@ public class PlaybackService extends Service {
         engine.resume();
         startForeground(1, notification(true));
         syncSessionState();
+        sessionHandler.removeCallbacks(sessionTicker);
+        sessionHandler.post(sessionTicker);
         notifyChanged();
     }
 
@@ -208,6 +344,7 @@ public class PlaybackService extends Service {
 
     /** PC版の「処理リセット」: 再生処理とキューを初期化する（ライブラリ・設定は保持）。 */
     public void resetProcessing() {
+        sessionHandler.removeCallbacks(sessionTicker);
         if (engine != null) engine.stop();
         queue.clear();
         current = -1;
@@ -272,7 +409,7 @@ public class PlaybackService extends Service {
         } catch (Exception ignored) { }
     }
 
-    /** 現在曲の埋め込みアートワークを取得（曲ごとにキャッシュ）。 */
+    /** 現在曲の埋め込みアートワークを取得（曲ごとにキャッシュ、最大512pxに縮小デコード）。 */
     private Bitmap artFor(Uri u) {
         if (u == null) return null;
         if (u.equals(artUri)) return artBitmap;
@@ -282,7 +419,7 @@ public class PlaybackService extends Service {
         try {
             r.setDataSource(this, u);
             byte[] pic = r.getEmbeddedPicture();
-            if (pic != null) artBitmap = BitmapFactory.decodeByteArray(pic, 0, pic.length);
+            if (pic != null) artBitmap = Tracks.decodeArt(pic, 512);
         } catch (Exception ignored) {
         } finally {
             try { r.release(); } catch (Exception ignored) { }
@@ -358,6 +495,8 @@ public class PlaybackService extends Service {
     }
 
     @Override public void onDestroy() {
+        sessionHandler.removeCallbacks(sessionTicker);
+        try { unregisterReceiver(noisyReceiver); } catch (Exception ignored) { }
         if (engine != null) engine.stop();
         if (session != null) {
             try { session.setActive(false); } catch (Exception ignored) { }

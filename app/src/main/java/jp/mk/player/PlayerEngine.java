@@ -40,6 +40,7 @@ public class PlayerEngine {
     private AudioTrack track;
     private volatile long startOffsetFrames = 0;
     private volatile float volume = 0.72f;
+    private volatile float duckFactor = 1f;
     private volatile Meters meters;
 
     public PlayerEngine(Context ctx) {
@@ -56,6 +57,9 @@ public class PlayerEngine {
     public Meters getMeters() { return meters; }
     public float getVolume() { return volume; }
     public void setVolume(float v) { volume = Math.max(0f, Math.min(1f, v)); }
+
+    /** オーディオフォーカスのダッキング用（通話・通知音などに一時的に譲る）。 */
+    public void setDuckFactor(float f) { duckFactor = Math.max(0f, Math.min(1f, f)); }
 
     public double getPositionSec() {
         AudioTrack t = track;
@@ -197,9 +201,16 @@ public class PlayerEngine {
                     .setBufferSizeInBytes(Math.max(minBuf * 2, sampleRate * channels * 4))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build();
+            int pcmEnc = AudioFormat.ENCODING_PCM_16BIT;
             dec = MediaCodec.createDecoderByType(mime);
             dec.configure(fmt, null, null, 0);
             dec.start();
+            try {
+                MediaFormat of0 = dec.getOutputFormat();
+                if (of0.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                    pcmEnc = of0.getInteger(MediaFormat.KEY_PCM_ENCODING);
+                }
+            } catch (Exception ignored) { }
             track.play();
             if (!playing) track.pause();
 
@@ -228,20 +239,21 @@ public class PlayerEngine {
                     }
                 }
                 int outIdx = dec.dequeueOutputBuffer(info, 10000);
-                if (outIdx >= 0) {
+                if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // 出力形式は変わった時だけ取り直す（毎バッファ取得は無駄）
+                    try {
+                        MediaFormat of = dec.getOutputFormat();
+                        if (of.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                            pcmEnc = of.getInteger(MediaFormat.KEY_PCM_ENCODING);
+                        }
+                    } catch (Exception ignored) { }
+                } else if (outIdx >= 0) {
                     ByteBuffer out = dec.getOutputBuffer(outIdx);
                     boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
                     if (info.size > 0 && track != null) {
                         out.position(info.offset);
                         out.limit(info.offset + info.size);
                         ByteBuffer le = out.order(ByteOrder.LITTLE_ENDIAN);
-                        int pcmEnc = AudioFormat.ENCODING_PCM_16BIT;
-                        try {
-                            MediaFormat of = dec.getOutputFormat();
-                            if (of.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
-                                pcmEnc = of.getInteger(MediaFormat.KEY_PCM_ENCODING);
-                            }
-                        } catch (Exception ignored) { }
                         int frames;
                         int need;
                         if (pcmEnc == AudioFormat.ENCODING_PCM_FLOAT) {
@@ -269,7 +281,7 @@ public class PlayerEngine {
                                 chunk[i] = v / 32768f;
                             }
                         }
-                        float g = volume;
+                        float g = volume * duckFactor;
                         if (g != 1f) {
                             for (int i = 0; i < need; i++) chunk[i] *= g;
                         }
